@@ -1,74 +1,74 @@
-# Real-ESRGAN Tkinter GUI (Python 3.8 / Windows)
+# Ultra-fast Promo Code Monitor (PyQt5 + mss + OCR)
 
-واجهة بسيطة بـ **Tkinter** لتشغيل `realesrgan-ncnn-vulkan.exe` على صورة واحدة أو على كل الصور داخل مجلد (Batch).
+Desktop tool to monitor a **tiny screen region** at high FPS and detect promo codes like `Y3761P` from an Android emulator stream.
 
-## هيكلة المشروع
+## Features
+
+- **Transparent ROI selector** to capture only the red banner area.
+- **High-speed grabbing** with `mss` (only selected ROI, not full screen).
+- **OpenCV preprocessing before OCR**:
+  - Grayscale conversion
+  - Binary thresholding with adjustable threshold
+- **Fast Tesseract OCR** tuned for single-line text (`--psm 7` by default).
+- **Regex extraction** for alphanumeric promo format (`\b[A-Z0-9]{5,7}\b`).
+- **Instant actions on match**:
+  - copy code to clipboard (`pyperclip`)
+  - play alert sound
+  - show code in huge text
+  - pause monitoring loop
+- **Responsive GUI** using a background `QThread`.
+
+## Project structure
 
 ```text
 faycal/
 ├─ app.py
-├─ README.md
-└─ requirements.txt
+├─ requirements.txt
+└─ README.md
 ```
 
-## المتطلبات
+## Requirements
 
-- Windows + Python 3.8
-- ملف Real-ESRGAN التنفيذي:
-  - `D:\Real-ESRGAN-master\realesrgan-ncnn-vulkan.exe`
-- (اختياري) مجلد الموديلات:
-  - `D:\Real-ESRGAN-master\models`
+- Python 3.9+
+- Tesseract OCR engine installed on system:
+  - Windows: install from UB Mannheim build or official installer
+  - Linux: `sudo apt install tesseract-ocr`
+- Pip dependencies from `requirements.txt`
 
-> الواجهة تحتوي قيماً افتراضية مطابقة لمساراتك ويمكن تعديلها من الواجهة.
+## Setup
 
-## التثبيت والتشغيل
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
 
-1. افتح CMD أو PowerShell داخل مجلد المشروع.
-2. (اختياري) أنشئ بيئة افتراضية.
-3. شغّل البرنامج:
+If `pytesseract` cannot find your Tesseract binary on Windows, add in `app.py` before OCR run:
+
+```python
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+```
+
+## Run
 
 ```bash
 python app.py
 ```
 
-## الميزات المنفذة
+## How to use
 
-1. **GUI بـ Tkinter**
-   - اختيار ملف exe
-   - اختيار مجلد models
-   - اختيار Input كصورة واحدة أو مجلد
-   - اختيار Output folder
-   - زر Start وزر Stop
+1. Click **Select ROI**.
+2. Drag a rectangle tightly around the promo code location (red banner only).
+3. (Optional) tune:
+   - **Threshold** (default `170`)
+   - **PSM** (`7` for line, `8` for single word)
+   - **Regex** (default `\b[A-Z0-9]{5,7}\b`)
+4. Click **Start Monitoring**.
+5. When a match is found, the app copies code, alerts, shows huge text, and pauses.
 
-2. **Batch processing**
-   - عند اختيار مجلد Input يتم معالجة كل الصور المدعومة داخله.
+## Performance notes
 
-3. **اختيار الموديل**
-   - `realesrgan-x4plus`
-   - `realesrgan-x4plus-anime`
+- Keep ROI **as small as possible** for max FPS.
+- `interval_ms=15` in code is aggressive; increase if CPU usage is high.
+- If OCR is noisy, adjust threshold and ROI tightness.
 
-4. **Scale (2x / 4x / Auto)**
-   - البرنامج يفحص هل `-s` مدعوم في نسخة exe عبر `-h`.
-   - إذا غير مدعوم، يرجع تلقائياً للوضع الافتراضي للموديل.
-
-5. **Progress + Log داخل الواجهة + log.txt**
-   - شريط تقدم ونص حالة.
-   - سجل مباشر داخل الواجهة.
-   - إنشاء/تحديث `log.txt` داخل مجلد النتائج.
-
-6. **الحفاظ على الامتداد**
-   - PNG يبقى PNG، JPG يبقى JPG ... إلخ.
-   - اسم الملف الناتج يكون بالشكل: `originalname_upscaled.ext`.
-
-7. **التحقق من المسارات وإنشاء المجلدات**
-   - التحقق من exe و input.
-   - إنشاء output تلقائياً إذا غير موجود.
-
-## الامتدادات المدعومة
-
-- `.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`, `.tif`, `.tiff`
-
-## ملاحظات
-
-- إذا كان مجلد `models` غير موجود، سيتم التشغيل بدون `-m` مع تسجيل تنبيه في الـ Log.
-- زر **Stop** يوقف المعالجة بين الملفات (بعد إنهاء الملف الجاري معالجته حالياً).

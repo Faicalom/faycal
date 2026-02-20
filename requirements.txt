@@ -1,2 +1,6 @@
-# No external dependencies are required.
-# Tkinter is included with standard Python on Windows.
+PyQt5==5.15.11
+mss==10.0.0
+opencv-python==4.11.0.86
+numpy==2.2.3
+pytesseract==0.3.13
+pyperclip==1.9.0
