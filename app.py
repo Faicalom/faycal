@@ -1,327 +1,280 @@
-import os
-import queue
-import subprocess
-import threading
+import re
+import sys
+import time
 from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, W, filedialog, messagebox, ttk
-import tkinter as tk
 
-
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
-DEFAULT_EXE = r"D:\Real-ESRGAN-master\realesrgan-ncnn-vulkan.exe"
-DEFAULT_MODELS_DIR = r"D:\Real-ESRGAN-master\models"
-DEFAULT_INPUT_DIR = r"D:\Real-ESRGAN-master\يدوي\input"
-DEFAULT_OUTPUT_DIR = r"D:\Real-ESRGAN-master\يدوي\results"
-MODELS = ("realesrgan-x4plus", "realesrgan-x4plus-anime")
-SCALES = ("Auto", "2", "4")
+import cv2
+import mss
+import numpy as np
+import pyperclip
+import pytesseract
+from PyQt5.QtCore import QObject, QPoint, QRect, QThread, Qt, pyqtSignal
+from PyQt5.QtGui import QGuiApplication, QPainter, QPen
+from PyQt5.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 
 @dataclass
-class AppConfig:
-    exe_path: Path
-    models_dir: Path
-    input_path: Path
-    output_dir: Path
-    model_name: str
-    scale_value: str
+class MonitorConfig:
+    bbox: dict
+    threshold: int
+    regex_pattern: str
+    psm: int
+    interval_ms: int
 
 
-class RealESRGANGUI:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title("Real-ESRGAN Batch GUI")
-        self.root.geometry("900x620")
+class CaptureWorker(QObject):
+    code_found = pyqtSignal(str)
+    status = pyqtSignal(str)
+    preview = pyqtSignal(str)
+    finished = pyqtSignal()
 
-        self.log_queue: "queue.Queue[str]" = queue.Queue()
-        self.worker_thread: threading.Thread | None = None
-        self.stop_event = threading.Event()
+    def __init__(self, config: MonitorConfig) -> None:
+        super().__init__()
+        self.config = config
+        self._running = True
 
-        self._build_ui()
-        self._poll_logs()
+    def stop(self) -> None:
+        self._running = False
 
-    def _build_ui(self) -> None:
-        frame = ttk.Frame(self.root, padding=12)
-        frame.pack(fill=BOTH, expand=True)
-
-        self.exe_var = tk.StringVar(value=DEFAULT_EXE)
-        self.models_var = tk.StringVar(value=DEFAULT_MODELS_DIR)
-        self.input_var = tk.StringVar(value=DEFAULT_INPUT_DIR)
-        self.output_var = tk.StringVar(value=DEFAULT_OUTPUT_DIR)
-        self.model_var = tk.StringVar(value=MODELS[0])
-        self.scale_var = tk.StringVar(value=SCALES[0])
-
-        self._path_row(frame, 0, "Real-ESRGAN EXE", self.exe_var, self._choose_exe)
-        self._path_row(frame, 1, "Models folder", self.models_var, self._choose_models_dir)
-        self._path_row(frame, 2, "Input (image/folder)", self.input_var, self._choose_input)
-        self._path_row(frame, 3, "Output folder", self.output_var, self._choose_output)
-
-        model_label = ttk.Label(frame, text="Model")
-        model_label.grid(row=4, column=0, sticky=W, pady=(8, 4))
-        model_combo = ttk.Combobox(frame, textvariable=self.model_var, values=MODELS, state="readonly")
-        model_combo.grid(row=4, column=1, sticky="ew", pady=(8, 4), padx=(8, 0))
-
-        scale_label = ttk.Label(frame, text="Scale")
-        scale_label.grid(row=4, column=2, sticky=W, pady=(8, 4), padx=(16, 0))
-        scale_combo = ttk.Combobox(frame, textvariable=self.scale_var, values=SCALES, state="readonly", width=10)
-        scale_combo.grid(row=4, column=3, sticky=W, pady=(8, 4), padx=(8, 0))
-
-        progress_frame = ttk.Frame(frame)
-        progress_frame.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(12, 8))
-        progress_frame.columnconfigure(0, weight=1)
-
-        self.progress = ttk.Progressbar(progress_frame, mode="determinate", maximum=100)
-        self.progress.grid(row=0, column=0, sticky="ew")
-
-        self.progress_label = ttk.Label(progress_frame, text="جاهز")
-        self.progress_label.grid(row=1, column=0, sticky=W, pady=(4, 0))
-
-        button_frame = ttk.Frame(frame)
-        button_frame.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(4, 10))
-
-        self.start_button = ttk.Button(button_frame, text="Start", command=self.start_processing)
-        self.start_button.pack(side=LEFT)
-
-        self.stop_button = ttk.Button(button_frame, text="Stop", command=self.stop_processing, state="disabled")
-        self.stop_button.pack(side=LEFT, padx=(8, 0))
-
-        clear_button = ttk.Button(button_frame, text="Clear Log", command=self._clear_log)
-        clear_button.pack(side=RIGHT)
-
-        log_label = ttk.Label(frame, text="Log")
-        log_label.grid(row=7, column=0, sticky=W)
-
-        self.log_text = tk.Text(frame, height=18, wrap="word")
-        self.log_text.grid(row=8, column=0, columnspan=4, sticky="nsew", pady=(4, 0))
-
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.log_text.yview)
-        scrollbar.grid(row=8, column=4, sticky="ns", pady=(4, 0))
-        self.log_text.configure(yscrollcommand=scrollbar.set)
-
-        frame.columnconfigure(1, weight=1)
-        frame.columnconfigure(3, weight=1)
-        frame.rowconfigure(8, weight=1)
-
-    def _path_row(self, parent: ttk.Frame, row: int, title: str, variable: tk.StringVar, callback) -> None:
-        label = ttk.Label(parent, text=title)
-        label.grid(row=row, column=0, sticky=W, pady=4)
-
-        entry = ttk.Entry(parent, textvariable=variable)
-        entry.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(8, 8), pady=4)
-
-        button = ttk.Button(parent, text="Browse", command=callback)
-        button.grid(row=row, column=3, sticky="ew", pady=4)
-
-    def _choose_exe(self) -> None:
-        path = filedialog.askopenfilename(title="Choose realesrgan-ncnn-vulkan.exe", filetypes=[("Executable", "*.exe")])
-        if path:
-            self.exe_var.set(path)
-
-    def _choose_models_dir(self) -> None:
-        path = filedialog.askdirectory(title="Choose models folder")
-        if path:
-            self.models_var.set(path)
-
-    def _choose_input(self) -> None:
-        choice = messagebox.askyesno("Input", "اختيار مجلد؟\nYes = Folder, No = Single image")
-        if choice:
-            path = filedialog.askdirectory(title="Choose input folder")
-        else:
-            path = filedialog.askopenfilename(title="Choose input image", filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff")])
-        if path:
-            self.input_var.set(path)
-
-    def _choose_output(self) -> None:
-        path = filedialog.askdirectory(title="Choose output folder")
-        if path:
-            self.output_var.set(path)
-
-    def _clear_log(self) -> None:
-        self.log_text.delete("1.0", END)
-
-    def _log(self, message: str) -> None:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.log_queue.put(f"[{timestamp}] {message}")
-
-    def _poll_logs(self) -> None:
-        while not self.log_queue.empty():
-            line = self.log_queue.get_nowait()
-            self.log_text.insert(END, line + "\n")
-            self.log_text.see(END)
-        self.root.after(120, self._poll_logs)
-
-    def _collect_images(self, input_path: Path) -> list[Path]:
-        if input_path.is_file():
-            return [input_path] if input_path.suffix.lower() in IMAGE_EXTENSIONS else []
-
-        images = []
-        for item in sorted(input_path.iterdir()):
-            if item.is_file() and item.suffix.lower() in IMAGE_EXTENSIONS:
-                images.append(item)
-        return images
-
-    def _supports_scale_arg(self, exe_path: Path) -> bool:
-        try:
-            result = subprocess.run(
-                [str(exe_path), "-h"],
-                capture_output=True,
-                text=True,
-                check=False,
-                encoding="utf-8",
-                errors="ignore",
-            )
-            help_text = (result.stdout or "") + "\n" + (result.stderr or "")
-            return "-s" in help_text
-        except OSError:
-            return False
-
-    def _validate(self) -> AppConfig | None:
-        exe_path = Path(self.exe_var.get().strip())
-        models_dir = Path(self.models_var.get().strip())
-        input_path = Path(self.input_var.get().strip())
-        output_dir = Path(self.output_var.get().strip())
-
-        if not exe_path.exists() or not exe_path.is_file():
-            messagebox.showerror("Error", "مسار ملف exe غير صحيح")
-            return None
-
-        if not input_path.exists():
-            messagebox.showerror("Error", "مسار الإدخال غير موجود")
-            return None
-
-        if not models_dir.exists():
-            self._log("تنبيه: مجلد models غير موجود. سيتم تشغيل الأداة بدون -m.")
-
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        return AppConfig(
-            exe_path=exe_path,
-            models_dir=models_dir,
-            input_path=input_path,
-            output_dir=output_dir,
-            model_name=self.model_var.get(),
-            scale_value=self.scale_var.get(),
+    def run(self) -> None:
+        self.status.emit("Monitoring started...")
+        pattern = re.compile(self.config.regex_pattern)
+        tesseract_cfg = (
+            f"--oem 3 --psm {self.config.psm} "
+            "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
         )
 
-    def start_processing(self) -> None:
-        if self.worker_thread and self.worker_thread.is_alive():
-            messagebox.showinfo("Info", "المعالجة تعمل حالياً")
-            return
+        with mss.mss() as sct:
+            while self._running:
+                shot = sct.grab(self.config.bbox)
+                frame = np.array(shot)
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                _, thresh = cv2.threshold(gray, self.config.threshold, 255, cv2.THRESH_BINARY)
 
-        config = self._validate()
-        if config is None:
-            return
+                raw_text = pytesseract.image_to_string(thresh, config=tesseract_cfg).upper().strip()
+                clean = re.sub(r"[^A-Z0-9\s]", " ", raw_text)
+                self.preview.emit(clean)
 
-        self.stop_event.clear()
-        self.start_button.configure(state="disabled")
-        self.stop_button.configure(state="normal")
-        self.progress.configure(value=0)
-        self.progress_label.configure(text="جارٍ التحضير...")
-
-        self.worker_thread = threading.Thread(target=self._process_images, args=(config,), daemon=True)
-        self.worker_thread.start()
-
-    def stop_processing(self) -> None:
-        self.stop_event.set()
-        self._log("تم طلب الإيقاف من المستخدم.")
-
-    def _set_ui_idle(self) -> None:
-        self.start_button.configure(state="normal")
-        self.stop_button.configure(state="disabled")
-
-    def _process_images(self, config: AppConfig) -> None:
-        log_path = config.output_dir / "log.txt"
-        images = self._collect_images(config.input_path)
-
-        if not images:
-            self._log("لم يتم العثور على صور للمعالجة.")
-            self.progress_label.configure(text="لا توجد صور")
-            self._set_ui_idle()
-            return
-
-        scale_supported = self._supports_scale_arg(config.exe_path)
-        if config.scale_value != "Auto" and not scale_supported:
-            self._log("خيار -s غير مدعوم في هذا الإصدار. سيتم استخدام Scale الافتراضي للموديل.")
-
-        total = len(images)
-        success = 0
-
-        with log_path.open("a", encoding="utf-8") as file_log:
-            file_log.write("\n" + "=" * 70 + "\n")
-            file_log.write(f"Run at: {datetime.now():%Y-%m-%d %H:%M:%S}\n")
-            file_log.write(f"Model: {config.model_name} | Scale: {config.scale_value}\n")
-            file_log.write(f"Input: {config.input_path}\nOutput: {config.output_dir}\n")
-
-            for idx, source in enumerate(images, start=1):
-                if self.stop_event.is_set():
-                    self._log("تم إيقاف العملية.")
+                match = pattern.search(clean)
+                if match:
+                    code = match.group(0)
+                    self.code_found.emit(code)
+                    self.status.emit(f"Code detected: {code}")
                     break
 
-                target = config.output_dir / f"{source.stem}_upscaled{source.suffix}"
-                cmd = [
-                    str(config.exe_path),
-                    "-i",
-                    str(source),
-                    "-o",
-                    str(target),
-                    "-n",
-                    config.model_name,
-                ]
+                time.sleep(self.config.interval_ms / 1000)
 
-                if config.models_dir.exists():
-                    cmd.extend(["-m", str(config.models_dir)])
+        self.finished.emit()
 
-                if config.scale_value != "Auto" and scale_supported:
-                    cmd.extend(["-s", config.scale_value])
 
-                self._log(f"[{idx}/{total}] Processing: {source.name}")
-                file_log.write(f"\n[{idx}/{total}] INPUT: {source}\n")
-                file_log.write("CMD: " + " ".join(cmd) + "\n")
+class RegionSelector(QWidget):
+    region_selected = pyqtSignal(dict)
 
-                try:
-                    result = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        encoding="utf-8",
-                        errors="ignore",
-                    )
-                except OSError as exc:
-                    stderr = str(exc)
-                    result_code = -1
-                else:
-                    stderr = result.stderr.strip()
-                    result_code = result.returncode
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setWindowState(Qt.WindowFullScreen)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setCursor(Qt.CrossCursor)
 
-                if result_code == 0:
-                    success += 1
-                    self._log(f"✅ Done: {target.name}")
-                    file_log.write("STATUS: SUCCESS\n")
-                else:
-                    self._log(f"❌ Failed: {source.name}")
-                    if stderr:
-                        self._log(f"   {stderr}")
-                    file_log.write("STATUS: FAILED\n")
-                    if stderr:
-                        file_log.write("ERROR: " + stderr + "\n")
+        self.origin = QPoint()
+        self.current = QPoint()
+        self.dragging = False
 
-                progress_value = int((idx / total) * 100)
-                self.progress.configure(value=progress_value)
-                self.progress_label.configure(text=f"{idx}/{total} processed")
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setBrush(Qt.transparent)
+        painter.fillRect(self.rect(), Qt.transparent)
 
-            file_log.write(f"\nSummary: {success}/{total} succeeded\n")
+        if self.dragging or not self.origin.isNull():
+            rect = QRect(self.origin, self.current).normalized()
+            pen = QPen(Qt.red, 3, Qt.SolidLine)
+            painter.setPen(pen)
+            painter.drawRect(rect)
 
-        self._log(f"انتهت المعالجة: {success}/{total} نجاح")
-        self.progress_label.configure(text=f"Finished: {success}/{total}")
-        self._set_ui_idle()
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self.origin = event.pos()
+            self.current = event.pos()
+            self.dragging = True
+            self.update()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self.dragging:
+            self.current = event.pos()
+            self.update()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton and self.dragging:
+            self.dragging = False
+            self.current = event.pos()
+            rect = QRect(self.origin, self.current).normalized()
+            if rect.width() > 5 and rect.height() > 5:
+                self.region_selected.emit(
+                    {
+                        "left": rect.x(),
+                        "top": rect.y(),
+                        "width": rect.width(),
+                        "height": rect.height(),
+                    }
+                )
+            self.close()
+
+
+class PromoMonitorWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Ultra-fast Promo Code Monitor")
+        self.setMinimumSize(640, 400)
+
+        self.bbox = None
+        self.worker_thread = None
+        self.worker = None
+
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+
+        self.box_label = QLabel("ROI: Not selected")
+        self.box_label.setStyleSheet("font-size: 16px;")
+
+        self.big_code = QLabel("-----")
+        self.big_code.setAlignment(Qt.AlignCenter)
+        self.big_code.setStyleSheet("font-size: 64px; font-weight: bold; color: #00aa00;")
+
+        self.status_label = QLabel("Ready")
+        self.preview_label = QLabel("OCR preview: ")
+
+        controls = QHBoxLayout()
+        self.select_btn = QPushButton("Select ROI")
+        self.start_btn = QPushButton("Start Monitoring")
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+
+        self.threshold_input = QLineEdit("170")
+        self.threshold_input.setMaximumWidth(80)
+        self.psm_input = QLineEdit("7")
+        self.psm_input.setMaximumWidth(60)
+        self.regex_input = QLineEdit(r"\b[A-Z0-9]{5,7}\b")
+
+        controls.addWidget(self.select_btn)
+        controls.addWidget(QLabel("Threshold:"))
+        controls.addWidget(self.threshold_input)
+        controls.addWidget(QLabel("PSM:"))
+        controls.addWidget(self.psm_input)
+        controls.addWidget(QLabel("Regex:"))
+        controls.addWidget(self.regex_input)
+        controls.addWidget(self.start_btn)
+        controls.addWidget(self.stop_btn)
+
+        layout.addWidget(self.box_label)
+        layout.addLayout(controls)
+        layout.addWidget(self.big_code)
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.preview_label)
+
+        self.select_btn.clicked.connect(self.open_selector)
+        self.start_btn.clicked.connect(self.start_monitoring)
+        self.stop_btn.clicked.connect(self.stop_monitoring)
+
+    def open_selector(self) -> None:
+        self.status_label.setText("Drag a rectangle around the promo code area...")
+        self.selector = RegionSelector()
+        self.selector.region_selected.connect(self._set_bbox)
+        self.selector.show()
+
+    def _set_bbox(self, bbox: dict) -> None:
+        self.bbox = bbox
+        self.box_label.setText(f"ROI: {bbox}")
+        self.status_label.setText("ROI selected.")
+
+    def start_monitoring(self) -> None:
+        if not self.bbox:
+            self.status_label.setText("Please select ROI first.")
+            return
+
+        try:
+            threshold = int(self.threshold_input.text())
+            psm = int(self.psm_input.text())
+        except ValueError:
+            self.status_label.setText("Threshold and PSM must be integers.")
+            return
+
+        regex_pattern = self.regex_input.text().strip() or r"\b[A-Z0-9]{5,7}\b"
+        config = MonitorConfig(
+            bbox=self.bbox,
+            threshold=threshold,
+            regex_pattern=regex_pattern,
+            psm=psm,
+            interval_ms=15,
+        )
+
+        self.worker_thread = QThread()
+        self.worker = CaptureWorker(config)
+        self.worker.moveToThread(self.worker_thread)
+
+        self.worker_thread.started.connect(self.worker.run)
+        self.worker.code_found.connect(self.on_code_found)
+        self.worker.status.connect(self.status_label.setText)
+        self.worker.preview.connect(lambda txt: self.preview_label.setText(f"OCR preview: {txt}"))
+        self.worker.finished.connect(self.worker_thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        self.worker_thread.finished.connect(self._thread_stopped)
+
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.worker_thread.start()
+
+    def stop_monitoring(self) -> None:
+        if self.worker:
+            self.worker.stop()
+            self.status_label.setText("Stopping...")
+
+    def _thread_stopped(self) -> None:
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+
+    def on_code_found(self, code: str) -> None:
+        pyperclip.copy(code)
+        self.big_code.setText(code)
+        self.big_code.setStyleSheet("font-size: 72px; font-weight: 900; color: #ff1111;")
+        self.play_alert()
+        self.status_label.setText(f"MATCH! Copied to clipboard: {code}. Monitoring paused.")
+        self.stop_monitoring()
+
+    def play_alert(self) -> None:
+        app = QGuiApplication.instance()
+        if app:
+            app.beep()
+
+        try:
+            import winsound
+
+            winsound.Beep(2400, 700)
+            winsound.Beep(2800, 700)
+        except Exception:
+            pass
 
 
 def main() -> None:
-    root = tk.Tk()
-    app = RealESRGANGUI(root)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    window = PromoMonitorWindow()
+    window.show()
+    sys.exit(app.exec_())
 
 
 if __name__ == "__main__":
